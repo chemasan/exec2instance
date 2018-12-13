@@ -1,0 +1,143 @@
+#!/usr/bin/env python
+
+# MIT License
+# 
+# Copyright (c) 2018 Jose Manuel Sanchez Madrid
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import boto3
+import time
+import argparse
+
+class SystemManager:
+	def __init__(self):
+		self.__client = boto3.client("ssm")
+
+	def sendCommand(self, command, instanceIds=None, targets=None):
+		if not instanceIds: instanceIds = []
+		if not targets: targets = []
+		response = self.__client.send_command(
+			InstanceIds=instanceIds,
+			Targets=targets,
+			DocumentName="AWS-RunShellScript",
+			Parameters={
+				"workingDirectory":["/"],
+				"executionTimeout":["60"],
+				"commands":[command]
+			},
+			MaxConcurrency="50",
+			MaxErrors="99%",
+			TimeoutSeconds=600
+		)
+		return response["Command"]["CommandId"]
+
+	def getCommand(self, commandId):
+		response = self.__client.list_commands(CommandId = commandId)
+		if len(response["Commands"]) <= 0: raise RuntimeError("Can't find an System Manager command with ID '{}'".format(commandId))
+		return response["Commands"][0]
+
+	def listInvocations(self, commandId):
+		response = self.__client.list_command_invocations(CommandId = commandId, Details = True)
+		invocations = []
+		invocations += response["CommandInvocations"]
+		while "NextToken" in response:
+			response = self.__client.list_command_invocations(CommandId = commandId, Details = True, NextToken = response["NextToken"])
+			invocations += response["CommandInvocations"]
+		return invocations
+
+class Configuration:
+	def __init__(self, command, instances=None, tags=None):
+		if not instances: instances=[]
+		if not tags: tags={}
+		self.command = command
+		self.instances = instances
+		self.tags = tags
+
+	def getTargets(self):
+		targets = []
+		for key, value in self.tags.iteritems():
+			targets.append({ "Key": "tag:{}".format(key), "Values": value})
+		return targets
+
+	def __str__(self):
+		return "Configuration(command='{}', instances={}, tags={}, getTargets={})".format(self.command, self.instances, self.tags, self.getTargets())
+		
+
+def printInvocation(invocation):
+	print "#### {} ####".format(invocation["InstanceId"])
+	print "Status: {}".format(invocation["Status"])
+	print "StatusDetails: {}".format(invocation["StatusDetails"])
+	print "ResponseCode: {}".format(invocation["CommandPlugins"][0]["ResponseCode"])
+	print "Output:"
+	print invocation["CommandPlugins"][0]["Output"]
+			
+def exec2instance(command, instanceIds=None, targets=None):
+	printed = []
+	manager = SystemManager()
+	commandId = manager.sendCommand(command, instanceIds, targets)
+	print "CommandId: {}".format(commandId)
+	print
+	while manager.getCommand(commandId)["Status"] not in ["Success", "Cancelled", "Failed", "TimedOut"]:
+		for invocation in manager.listInvocations(commandId): 
+			if invocation["Status"] in ["Success", "Cancelled", "Failed", "TimedOut"] and invocation["InstanceId"] not in printed:
+				printInvocation(invocation)
+				printed.append(invocation["InstanceId"])
+		time.sleep(2)
+	for invocation in manager.listInvocations(commandId): 
+		if invocation["InstanceId"] not in printed: printInvocation(invocation)
+	print 
+	commandResult = manager.getCommand(commandId)
+	print "#### SUMMARY ####"
+	print "CommandId: {}".format(commandId)
+	print "Status: {}".format(commandResult["Status"])
+	print "StatusDetails: {}".format(commandResult["StatusDetails"])
+	print "TargetCount: {}".format(commandResult["TargetCount"])
+	print "CompletedCount: {}".format(commandResult["CompletedCount"])
+	print "ErrorCount: {}".format(commandResult["ErrorCount"])
+	print "DeliveryTimedOutCount: {}".format(commandResult["DeliveryTimedOutCount"])
+	if commandResult["Status"] == "Success": return 0
+	else: return 1
+
+def parseCmdConfig():
+	parser = argparse.ArgumentParser(description="Execute commands across EC2 instances using SSM")
+	parser.add_argument("--instance","-i",dest="instances",action="append",help="ID of the EC2 instance to run the command in. Multiple IDs can be specified by setting this option multiple times.")
+	parser.add_argument("--tag","-t",dest="tags",action="append",help="Tag in the format '<Key>=<Value>' to search for instances to run the command in. Multiple tags can be indicated by using this option multiple times. When different tags are set, the command will run only on those instances that match all the indicated tags.")
+	parser.add_argument("command",nargs="+",help="Command to run in the EC2 instances")
+	args = parser.parse_args()
+	if not args.instances and not args.tags:
+		print "error: At least one of --instance/-i or --tag/-t must be set"
+		exit(1)
+	command = " ".join(args.command)
+	instances = args.instances if args.instances else []
+	tags = {}
+	if args.tags:
+		for tag in args.tags:
+			splittedtag=tag.split("=",1)
+			tagKey   = splittedtag[0]
+			tagValue = splittedtag[1] if len(splittedtag) >= 2 else ""
+			if tagKey not in tags: tags[tagKey] = []
+			if tagValue not in tags[tagKey]: tags[tagKey].append(tagValue)
+	return Configuration(command, instances, tags)
+
+
+if __name__ == "__main__":
+	config = parseCmdConfig()
+	ret = exec2instance(config.command, config.instances, config.getTargets())
+	exit(ret)
